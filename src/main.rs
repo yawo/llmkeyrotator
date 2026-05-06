@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     env,
+    error::Error,
     fs::File,
     io::BufReader,
     net::SocketAddr,
@@ -21,6 +22,61 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+
+mod dns {
+    use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::net::SocketAddr;
+    use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+    use trust_dns_resolver::TokioAsyncResolver;
+
+    pub struct GoogleDnsResolver {
+        inner: TokioAsyncResolver,
+    }
+
+    impl GoogleDnsResolver {
+        pub fn new() -> Self {
+            let mut config = ResolverConfig::new();
+            config.add_name_server(NameServerConfig {
+                socket_addr: "8.8.8.8:53".parse::<SocketAddr>().unwrap(),
+                protocol: Protocol::Udp,
+                tls_dns_name: None,
+                trust_negative_responses: false,
+                bind_addr: None,
+            });
+            config.add_name_server(NameServerConfig {
+                socket_addr: "8.8.4.4:53".parse::<SocketAddr>().unwrap(),
+                protocol: Protocol::Udp,
+                tls_dns_name: None,
+                trust_negative_responses: false,
+                bind_addr: None,
+            });
+            config.add_name_server(NameServerConfig {
+                socket_addr: "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+                protocol: Protocol::Udp,
+                tls_dns_name: None,
+                trust_negative_responses: false,
+                bind_addr: None,
+            });
+            let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
+            Self { inner: resolver }
+        }
+    }
+
+    impl Resolve for GoogleDnsResolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            let inner = self.inner.clone();
+            let host = name.as_str().to_string();
+            Box::pin(async move {
+                let response = inner.lookup_ip(host).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let addrs: Vec<SocketAddr> = response
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip, 0))
+                    .collect();
+                Ok(Box::new(addrs.into_iter()) as Addrs)
+            })
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Provider {
@@ -259,9 +315,10 @@ async fn catch_all(
 
     let provider = get_current_provider(&state);
     let path = uri.path();
+    let path = path.strip_prefix("/v1").unwrap_or(path);
     let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
 
-    info!(provider = %provider.name, path = path, "Proxying request");
+    info!(provider = %provider.name, path = path, url = %url, "Proxying request");
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
@@ -321,7 +378,13 @@ async fn catch_all(
             }
         }
         Err(e) => {
-            error!(error = %e, provider = %provider.name, "Proxy request failed");
+            let mut err_msg = format!("{}", e);
+            let mut src = e.source();
+            while let Some(s) = src {
+                err_msg.push_str(&format!(" | source: {}", s));
+                src = s.source();
+            }
+            error!(error = %err_msg, provider = %provider.name, url = %url, "Proxy request failed");
             {
                 let stats = state.stats.lock().await;
                 stats.total_errors.fetch_add(1, Ordering::Relaxed);
@@ -329,7 +392,7 @@ async fn catch_all(
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse {
-                    error: "Upstream error".to_string(),
+                    error: err_msg,
                 }),
             )
                 .into_response()
@@ -370,6 +433,9 @@ async fn main() {
         current_index: Arc::new(AtomicUsize::new(0)),
         client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .dns_resolver(Arc::new(dns::GoogleDnsResolver::new()))
             .build()
             .expect("Failed to build HTTP client"),
         stats: Arc::new(Mutex::new(Stats::default())),

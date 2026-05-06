@@ -2,3 +2,5 @@
 Cargo.lock
 *.original.md
 llmkeys.csv
+.kilo
+.env

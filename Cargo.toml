@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 axum = { version = "0.7", features = ["json"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+trust-dns-resolver = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
