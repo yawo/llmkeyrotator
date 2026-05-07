@@ -4,3 +4,4 @@ Cargo.lock
 llmkeys.csv
 .kilo
 .env
+handoff.md
