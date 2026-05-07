@@ -30,10 +30,11 @@ groq,https://api.groq.com/openai/v1,llama-3.3-70b,gsk_...
 
 ## Endpoints
 
-- `POST /v1/chat/completions` — OpenAI-compatible, rotated across providers
+- `POST /v1/*` — OpenAI-compatible proxy (e.g. `/v1/chat/completions`). Strips `/v1` prefix, forwards to provider `base_url + rest_of_path`. Always uses model from CSV.
+- `POST /anthropic/*` — Anthropic-compatible proxy (e.g. `/anthropic/v1/messages`). Converts Anthropic ↔ OpenAI format, strips `/anthropic` prefix, forwards to provider. Always uses model from CSV.
 - `GET /health` — Status, provider count, current provider
 - `GET /stats` — Request/error/rotation counts, per-provider failure stats
-- `/*` — Catch-all proxy to current provider
+- `/*` — Catch-all proxy to current provider (strips `/v1` or `/anthropic` prefix if present, always uses model from CSV)
 
 ## Build
 
@@ -45,22 +46,22 @@ cargo build
 cargo build --release
 ```
 
-## Static Binaries (musl)
+## Static Binaries
 
 ### Android ARM64 (via NDK)
 
 ```bash
 # Prerequisites: Have Android NDK installed (tested with r29)
-export ANDROID_NDK_HOME=/home/yawo/android-sdk/ndk/29.0.14206865
+# Configure .cargo/config.toml with NDK toolchain paths
 
 # Add target and build
-rustup target add aarch64-unknown-linux-musl
-cargo build --release --target aarch64-unknown-linux-musl
+rustup target add aarch64-linux-android
+cargo build --release --target aarch64-linux-android
 ```
 
-Output: `target/aarch64-unknown-linux-musl/release/llmkeyrotator` (3.5MB statically-linked ELF)
+Output: `target/aarch64-linux-android/release/llmkeyrotator`
 
-### Ubuntu x64
+### Ubuntu x64 (musl)
 
 ```bash
 # Prerequisites: Install musl-tools

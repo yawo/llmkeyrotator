@@ -4,16 +4,16 @@ set -euo pipefail
 # Build static musl binaries for Ubuntu x64 and Android ARM64
 #
 # Prerequisites:
-#   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+#   rustup target add x86_64-unknown-linux-musl aarch64-linux-android
 #   sudo apt install musl-tools   # for x86_64 musl target
 
 NDK=/home/yawo/android-sdk/ndk/29.0.14206865
 
-echo "=== Building aarch64-unknown-linux-musl (Android ARM64) ==="
-rustup target add aarch64-unknown-linux-musl 2>/dev/null || true
-cargo build --release --target aarch64-unknown-linux-musl
-echo "=== Done: target/aarch64-unknown-linux-musl/release/llmkeyrotator ==="
-file target/aarch64-unknown-linux-musl/release/llmkeyrotator
+echo "=== Building aarch64-linux-android (Android ARM64) ==="
+rustup target add aarch64-linux-android 2>/dev/null || true
+cargo build --release --target aarch64-linux-android
+echo "=== Done: target/aarch64-linux-android/release/llmkeyrotator ==="
+file target/aarch64-linux-android/release/llmkeyrotator
 
 echo ""
 echo "=== Building x86_64-unknown-linux-musl (Ubuntu x64) ==="
