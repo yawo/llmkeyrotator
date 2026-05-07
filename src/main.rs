@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 mod anthropic {
     use serde_json::Value;
+    use std::collections::HashSet;
 
     pub fn request_to_openai(body: &mut Value) -> Value {
         let mut openai = serde_json::Map::new();
@@ -68,86 +69,100 @@ mod anthropic {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                 let content = msg.get("content");
 
-                let openai_content = match content {
-                    Some(Value::String(s)) => Value::String(s.clone()),
-                    Some(Value::Array(blocks)) => {
-                        let converted: Vec<Value> = blocks
-                            .iter()
-                            .filter_map(|block| {
-                                let btype = block.get("type").and_then(|t| t.as_str())?;
-                                match btype {
-                                    "text" => {
-                                        let text = block.get("text").and_then(|t| t.as_str())?;
-                                        Some(serde_json::json!({
-                                            "type": "text",
-                                            "text": text
-                                        }))
-                                    }
-                                    "tool_use" => {
-                                        let id = block.get("id")?;
-                                        let name = block.get("name")?;
-                                        let input = block.get("input")?;
-                                        Some(serde_json::json!({
-                                            "type": "function",
-                                            "function": {
-                                                "name": name,
-                                                "arguments": serde_json::to_string(input).unwrap_or_default()
-                                            },
-                                            "id": id
-                                        }))
-                                    }
-                                    "tool_result" => {
-                                        let tool_use_id = block.get("tool_use_id").and_then(|t| t.as_str())?;
-                                        let result_content = block.get("content").map(|c| {
-                                            if c.is_string() {
-                                                c.as_str().unwrap_or("").to_string()
-                                            } else {
-                                                serde_json::to_string(c).unwrap_or_default()
-                                            }
-                                        }).unwrap_or_default();
-                                        Some(serde_json::json!({
-                                            "role": "tool",
-                                            "tool_call_id": tool_use_id,
-                                            "content": result_content
-                                        }))
-                                    }
-                                    _ => None,
-                                }
-                            })
-                            .collect();
-
-                        if converted.len() == 1
-                            && converted[0].is_object()
-                            && converted[0].get("role").is_some()
-                        {
-                            messages.push(converted[0].clone());
-                            continue;
-                        }
-
-                        if converted.len() == 1
-                            && converted[0].get("type") == Some(&Value::String("text".to_string()))
-                        {
-                            Value::String(
-                                converted[0]
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                            )
-                        } else {
-                            Value::Array(converted)
-                        }
-                    }
-                    _ => continue,
-                };
-
                 if role == "tool" {
                     messages.push(content.unwrap_or(&Value::Null).clone());
-                } else {
-                    messages.push(serde_json::json!({
-                        "role": role,
-                        "content": openai_content
-                    }));
+                    continue;
+                }
+
+                match content {
+                    Some(Value::String(s)) => {
+                        messages.push(serde_json::json!({
+                            "role": role,
+                            "content": s.clone()
+                        }));
+                    }
+                    Some(Value::Array(blocks)) => {
+                        let mut text_parts: Vec<String> = Vec::new();
+                        let mut tool_calls: Vec<Value> = Vec::new();
+                        let mut tool_results: Vec<Value> = Vec::new();
+
+                        for block in blocks {
+                            let btype = match block.get("type").and_then(|t| t.as_str()) {
+                                Some(t) => t,
+                                None => continue,
+                            };
+                            match btype {
+                                "text" => {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                        text_parts.push(text.to_string());
+                                    }
+                                }
+                                "tool_use" => {
+                                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let input = block.get("input").unwrap_or(&Value::Null);
+                                    let arguments = serde_json::to_string(input).unwrap_or_default();
+                                    tool_calls.push(serde_json::json!({
+                                        "id": id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": arguments
+                                        }
+                                    }));
+                                }
+                                "tool_result" => {
+                                    let tool_use_id = block.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
+                                    let result_content = block.get("content").map(|c| {
+                                        if c.is_string() {
+                                            c.as_str().unwrap_or("").to_string()
+                                        } else {
+                                            serde_json::to_string(c).unwrap_or_default()
+                                        }
+                                    }).unwrap_or_default();
+                                    tool_results.push(serde_json::json!({
+                                        "role": "tool",
+                                        "tool_call_id": tool_use_id,
+                                        "content": result_content
+                                    }));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        for tr in &tool_results {
+                            messages.push(tr.clone());
+                        }
+
+                        if !tool_calls.is_empty() || !text_parts.is_empty() {
+                            let mut msg_obj = serde_json::Map::new();
+                            msg_obj.insert("role".to_string(), Value::String(role.to_string()));
+
+                            if !text_parts.is_empty() {
+                                if text_parts.len() == 1 {
+                                    msg_obj.insert("content".to_string(), Value::String(text_parts.remove(0)));
+                                } else {
+                                    msg_obj.insert("content".to_string(), Value::Array(
+                                        text_parts.into_iter().map(Value::String).collect()
+                                    ));
+                                }
+                            } else if !tool_calls.is_empty() {
+                                msg_obj.insert("content".to_string(), Value::Null);
+                            }
+
+                            if !tool_calls.is_empty() {
+                                msg_obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
+                            }
+
+                            messages.push(Value::Object(msg_obj));
+                        }
+                    }
+                    _ => {
+                        messages.push(serde_json::json!({
+                            "role": role,
+                            "content": Value::Null
+                        }));
+                    }
                 }
             }
         }
@@ -304,19 +319,9 @@ mod anthropic {
         })
     }
 
-    pub fn sse_chunk_to_anthropic(openai_chunk: &str) -> Vec<String> {
-        let mut events = Vec::new();
-
-        let chunk: Value = match serde_json::from_str(openai_chunk) {
-            Ok(v) => v,
-            Err(_) => return events,
-        };
-
-        let id = chunk.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let model = chunk.get("model").and_then(|v| v.as_str()).unwrap_or("");
-
-        events.push(format!(
-            "event: message_start\ndata: {}",
+    pub fn sse_message_start(id: &str, model: &str) -> (String, String) {
+        (
+            "message_start".to_string(),
             serde_json::json!({
                 "type": "message_start",
                 "message": {
@@ -329,30 +334,45 @@ mod anthropic {
                     "stop_sequence": null,
                     "usage": { "input_tokens": 0, "output_tokens": 0 }
                 }
-            })
-        ));
+            }).to_string(),
+        )
+    }
 
-        events.push(format!(
-            "event: content_block_start\ndata: {}",
-            serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": { "type": "text", "text": "" }
-            })
-        ));
+    pub fn sse_chunk_to_anthropic(openai_chunk: &str) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+
+        let chunk: Value = match serde_json::from_str(openai_chunk) {
+            Ok(v) => v,
+            Err(_) => return events,
+        };
+
+        let mut has_text = false;
+        let mut opened_tool_indices: HashSet<usize> = HashSet::new();
+        let mut stop_reason: Option<String> = None;
 
         if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
             for choice in choices {
                 if let Some(delta) = choice.get("delta") {
                     if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                         if !text.is_empty() {
-                            events.push(format!(
-                                "event: content_block_delta\ndata: {}",
+                            if !has_text {
+                                events.push((
+                                    "content_block_start".to_string(),
+                                    serde_json::json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": { "type": "text", "text": "" }
+                                    }).to_string(),
+                                ));
+                                has_text = true;
+                            }
+                            events.push((
+                                "content_block_delta".to_string(),
                                 serde_json::json!({
                                     "type": "content_block_delta",
                                     "index": 0,
                                     "delta": { "type": "text_delta", "text": text }
-                                })
+                                }).to_string(),
                             ));
                         }
                     }
@@ -372,31 +392,34 @@ mod anthropic {
                                 .and_then(|a| a.as_str())
                                 .unwrap_or("");
 
-                            events.push(format!(
-                                "event: content_block_start\ndata: {}",
-                                serde_json::json!({
-                                    "type": "content_block_start",
-                                    "index": tc_index + 1,
-                                    "content_block": {
-                                        "type": "tool_use",
-                                        "id": tc_id,
-                                        "name": tc_name,
-                                        "input": {}
-                                    }
-                                })
-                            ));
+                            if !opened_tool_indices.contains(&tc_index) {
+                                events.push((
+                                    "content_block_start".to_string(),
+                                    serde_json::json!({
+                                        "type": "content_block_start",
+                                        "index": tc_index,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": tc_id,
+                                            "name": tc_name,
+                                            "input": {}
+                                        }
+                                    }).to_string(),
+                                ));
+                                opened_tool_indices.insert(tc_index);
+                            }
 
                             if !tc_args.is_empty() {
-                                events.push(format!(
-                                    "event: content_block_delta\ndata: {}",
+                                events.push((
+                                    "content_block_delta".to_string(),
                                     serde_json::json!({
                                         "type": "content_block_delta",
-                                        "index": tc_index + 1,
+                                        "index": tc_index,
                                         "delta": {
                                             "type": "input_json_delta",
                                             "partial_json": tc_args
                                         }
-                                    })
+                                    }).to_string(),
                                 ));
                             }
                         }
@@ -404,36 +427,48 @@ mod anthropic {
                 }
 
                 if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                    let stop_reason = match reason {
-                        "stop" => "end_turn",
-                        "length" => "max_tokens",
-                        "tool_calls" => "tool_use",
-                        _ => "end_turn",
-                    };
-                    events.push(format!(
-                        "event: message_delta\ndata: {}",
-                        serde_json::json!({
-                            "type": "message_delta",
-                            "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                            "usage": { "output_tokens": 0 }
-                        })
-                    ));
+                    stop_reason = Some(match reason {
+                        "stop" => "end_turn".to_string(),
+                        "length" => "max_tokens".to_string(),
+                        "tool_calls" => "tool_use".to_string(),
+                        _ => "end_turn".to_string(),
+                    });
                 }
             }
         }
 
-        events.push(format!(
-            "event: content_block_stop\ndata: {}",
-            serde_json::json!({
-                "type": "content_block_stop",
-                "index": 0
-            })
-        ));
+        if let Some(reason) = stop_reason {
+            let mut all_stop_indices: Vec<usize> = Vec::new();
+            if has_text {
+                all_stop_indices.push(0);
+            }
+            all_stop_indices.extend(opened_tool_indices.iter().copied());
+            all_stop_indices.sort();
+            all_stop_indices.dedup();
+            for idx in all_stop_indices {
+                events.push((
+                    "content_block_stop".to_string(),
+                    serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": idx
+                    }).to_string(),
+                ));
+            }
 
-        events.push(format!(
-            "event: message_stop\ndata: {}",
-            serde_json::json!({ "type": "message_stop" })
-        ));
+            events.push((
+                "message_delta".to_string(),
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": reason, "stop_sequence": null },
+                    "usage": { "output_tokens": 0 }
+                }).to_string(),
+            ));
+
+            events.push((
+                "message_stop".to_string(),
+                serde_json::json!({ "type": "message_stop" }).to_string(),
+            ));
+        }
 
         events
     }
@@ -652,19 +687,32 @@ async fn proxy_openai(
                     if streaming {
                         let stream = resp.bytes_stream().map(|result| match result {
                             Ok(bytes) => {
-                                let event = axum::response::sse::Event::default()
-                                    .data(String::from_utf8_lossy(&bytes).to_string());
-                                Ok(event)
+                                let text = String::from_utf8_lossy(&bytes).to_string();
+                                let mut events = Vec::new();
+                                for line in text.lines() {
+                                    let line = line.trim();
+                                    if line.starts_with("data: ") {
+                                        let data = &line[6..];
+                                        if data != "[DONE]" {
+                                            events.push(Ok(
+                                                axum::response::sse::Event::default()
+                                                    .data(data.to_string()),
+                                            ));
+                                        }
+                                    }
+                                }
+                                futures::stream::iter(events)
                             }
                             Err(e) => {
                                 error!(error = %e, "Stream error");
-                                Err(std::io::Error::new(
+                                futures::stream::iter(vec![Err(std::io::Error::new(
                                     std::io::ErrorKind::Other,
                                     e.to_string(),
-                                ))
+                                ))])
                             }
                         });
-                        return Sse::new(stream)
+                        let flat_stream = stream.flatten();
+                        return Sse::new(flat_stream)
                             .keep_alive(
                                 axum::response::sse::KeepAlive::new()
                                     .interval(std::time::Duration::from_secs(15))
@@ -768,41 +816,64 @@ async fn proxy_anthropic(
                 let status = resp.status();
                 if status.is_success() {
                     if streaming {
-                        let stream = resp.bytes_stream().map(|result| match result {
-                            Ok(bytes) => {
-                                let text = String::from_utf8_lossy(&bytes).to_string();
-                                let mut events = Vec::new();
-                                for line in text.lines() {
-                                    let line = line.trim();
-                                    if line.starts_with("data: ") {
-                                        let data = &line[6..];
-                                        if data == "[DONE]" {
-                                            events.push(Ok(
-                                                axum::response::sse::Event::default()
-                                                    .event("message_stop")
-                                                    .data(
-                                                        serde_json::json!({"type": "message_stop"})
-                                                            .to_string(),
-                                                    ),
-                                            ));
-                                        } else {
-                                            for evt in anthropic::sse_chunk_to_anthropic(data) {
+                        use std::sync::atomic::AtomicBool;
+                        let msg_id = Arc::new(Mutex::new(String::new()));
+                        let msg_model = Arc::new(Mutex::new(String::new()));
+                        let sent_start = Arc::new(AtomicBool::new(false));
+
+                        let msg_id_clone = msg_id.clone();
+                        let msg_model_clone = msg_model.clone();
+                        let sent_start_clone = sent_start.clone();
+
+                        let mut buf = String::new();
+                        let stream = resp.bytes_stream().map(move |result| {
+                            match result {
+                                Ok(bytes) => {
+                                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                                    let mut events = Vec::new();
+                                    while let Some(pos) = buf.find('\n') {
+                                        let line = buf[..pos].trim().to_string();
+                                        buf = buf[pos + 1..].to_string();
+                                        if line.starts_with("data: ") {
+                                            let data = &line[6..];
+                                            if data == "[DONE]" {
+                                                continue;
+                                            }
+                                            if !sent_start_clone.swap(true, Ordering::SeqCst) {
+                                                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                                    let mut id = msg_id_clone.blocking_lock();
+                                                    let mut model = msg_model_clone.blocking_lock();
+                                                    *id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                    *model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                }
+                                                let id = msg_id_clone.blocking_lock().clone();
+                                                let model = msg_model_clone.blocking_lock().clone();
+                                                let (et, ed) = anthropic::sse_message_start(&id, &model);
                                                 events.push(Ok(
                                                     axum::response::sse::Event::default()
-                                                        .data(evt),
+                                                        .event(et)
+                                                        .data(ed),
+                                                ));
+                                            }
+                                            for (event_type, event_data) in anthropic::sse_chunk_to_anthropic(data) {
+                                                events.push(Ok(
+                                                    axum::response::sse::Event::default()
+                                                        .event(event_type)
+                                                        .data(event_data),
                                                 ));
                                             }
                                         }
                                     }
+                                    futures::stream::iter(events)
                                 }
-                                futures::stream::iter(events)
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Anthropic stream error");
-                                futures::stream::iter(vec![Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))])
+                                Err(e) => {
+                                    error!(error = %e, "Anthropic stream error");
+                                    buf.clear();
+                                    futures::stream::iter(vec![Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    ))])
+                                }
                             }
                         });
 
