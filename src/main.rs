@@ -43,22 +43,16 @@ mod anthropic {
                     "content": system
                 }));
             } else if system.is_array() {
-                let blocks: Vec<Value> = system
+                let texts: Vec<String> = system
                     .as_array()
                     .unwrap()
                     .iter()
-                    .filter_map(|b| {
-                        let text = b.get("text").and_then(|t| t.as_str())?;
-                        Some(serde_json::json!({
-                            "type": "text",
-                            "text": text
-                        }))
-                    })
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
                     .collect();
-                if !blocks.is_empty() {
+                if !texts.is_empty() {
                     messages.push(serde_json::json!({
                         "role": "system",
-                        "content": blocks
+                        "content": texts.join("\n")
                     }));
                 }
             }
@@ -139,13 +133,7 @@ mod anthropic {
                             msg_obj.insert("role".to_string(), Value::String(role.to_string()));
 
                             if !text_parts.is_empty() {
-                                if text_parts.len() == 1 {
-                                    msg_obj.insert("content".to_string(), Value::String(text_parts.remove(0)));
-                                } else {
-                                    msg_obj.insert("content".to_string(), Value::Array(
-                                        text_parts.into_iter().map(Value::String).collect()
-                                    ));
-                                }
+                                msg_obj.insert("content".to_string(), Value::String(text_parts.join("\n")));
                             } else if !tool_calls.is_empty() {
                                 msg_obj.insert("content".to_string(), Value::Null);
                             }
@@ -189,40 +177,52 @@ mod anthropic {
             openai.insert("stream".to_string(), stream.clone());
         }
 
-        if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
-            let converted_tools: Vec<Value> = tools
+        let has_tools = body
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+
+        if has_tools {
+            let converted_tools: Vec<Value> = body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .unwrap()
                 .iter()
                 .map(|tool| {
-                    let mut t = tool.clone();
-                    if let Some(obj) = t.as_object_mut() {
-                        if let Some(input_schema) = obj.remove("input_schema") {
-                            obj.insert("parameters".to_string(), input_schema);
+                    let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                    let parameters = tool.get("input_schema").cloned().unwrap_or(Value::Null);
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": description,
+                            "parameters": parameters
                         }
-                        obj.insert("type".to_string(), Value::String("function".to_string()));
-                    }
-                    t
+                    })
                 })
                 .collect();
             openai.insert("tools".to_string(), Value::Array(converted_tools));
-        }
 
-        if let Some(tool_choice) = body.get("tool_choice") {
-            let converted = match tool_choice.get("type").and_then(|t| t.as_str()) {
-                Some("auto") => serde_json::json!("auto"),
-                Some("any") => serde_json::json!("any"),
-                Some("tool") => {
-                    if let Some(name) = tool_choice.get("name") {
-                        serde_json::json!({
-                            "type": "function",
-                            "function": { "name": name }
-                        })
-                    } else {
-                        serde_json::json!("auto")
+            if let Some(tool_choice) = body.get("tool_choice") {
+                let converted = match tool_choice.get("type").and_then(|t| t.as_str()) {
+                    Some("auto") => serde_json::json!("auto"),
+                    Some("any") => serde_json::json!("any"),
+                    Some("tool") => {
+                        if let Some(name) = tool_choice.get("name") {
+                            serde_json::json!({
+                                "type": "function",
+                                "function": { "name": name }
+                            })
+                        } else {
+                            serde_json::json!("auto")
+                        }
                     }
-                }
-                _ => serde_json::json!("auto"),
-            };
-            openai.insert("tool_choice".to_string(), converted);
+                    _ => serde_json::json!("auto"),
+                };
+                openai.insert("tool_choice".to_string(), converted);
+            }
         }
 
         Value::Object(openai)
@@ -774,7 +774,7 @@ async fn proxy_openai(
 async fn proxy_anthropic(
     State(state): State<AppState>,
     headers: HeaderMap,
-    uri: Uri,
+    _uri: Uri,
     Json(mut body): Json<Value>,
 ) -> Response {
     if let Err(resp) = auth_check(&state, &headers) {
@@ -803,11 +803,7 @@ async fn proxy_anthropic(
             "Forwarding Anthropic request"
         );
 
-        let path = uri.path();
-        let path = path
-            .strip_prefix("/anthropic")
-            .unwrap_or(path);
-        let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
+        let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
 
         let request_builder = state
             .client
@@ -822,8 +818,8 @@ async fn proxy_anthropic(
                 if status.is_success() {
                     if streaming {
                         use std::sync::atomic::AtomicBool;
-                        let msg_id = Arc::new(Mutex::new(String::new()));
-                        let msg_model = Arc::new(Mutex::new(String::new()));
+                        let msg_id = Arc::new(std::sync::Mutex::new(String::new()));
+                        let msg_model = Arc::new(std::sync::Mutex::new(String::new()));
                         let sent_start = Arc::new(AtomicBool::new(false));
 
                         let msg_id_clone = msg_id.clone();
@@ -846,13 +842,13 @@ async fn proxy_anthropic(
                                             }
                                             if !sent_start_clone.swap(true, Ordering::SeqCst) {
                                                 if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                                    let mut id = msg_id_clone.blocking_lock();
-                                                    let mut model = msg_model_clone.blocking_lock();
+                                                    let mut id = msg_id_clone.lock().unwrap();
+                                                    let mut model = msg_model_clone.lock().unwrap();
                                                     *id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                                                     *model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
                                                 }
-                                                let id = msg_id_clone.blocking_lock().clone();
-                                                let model = msg_model_clone.blocking_lock().clone();
+                                                let id = msg_id_clone.lock().unwrap().clone();
+                                                let model = msg_model_clone.lock().unwrap().clone();
                                                 let (et, ed) = anthropic::sse_message_start(&id, &model);
                                                 events.push(Ok(
                                                     axum::response::sse::Event::default()
