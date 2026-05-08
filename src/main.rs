@@ -577,15 +577,14 @@ fn get_current_provider(state: &AppState) -> &Provider {
     &state.providers[idx % state.providers.len()]
 }
 
-fn rotate_provider(state: &AppState) {
+async fn rotate_provider(state: &AppState) {
     let idx = state.current_index.fetch_add(1, Ordering::Relaxed);
-    let provider_name = &state.providers[idx % state.providers.len()].name;
-    warn!(from = provider_name, "Rotating to next provider");
-    state
-        .stats
-        .blocking_lock()
-        .total_rotations
-        .fetch_add(1, Ordering::Relaxed);
+    let new_idx = idx + 1;
+    let from_name = &state.providers[idx % state.providers.len()].name;
+    let to_name = &state.providers[new_idx % state.providers.len()].name;
+    warn!(from = from_name, to = to_name, "Rotating to next provider");
+    let stats = state.stats.lock().await;
+    stats.total_rotations.fetch_add(1, Ordering::Relaxed);
 }
 
 fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -752,11 +751,17 @@ async fn proxy_openai(
         }
 
         if attempt < max_retries - 1 {
-            rotate_provider(&state);
+            warn!(
+                failed_provider = %provider.name,
+                next_attempt = attempt + 2,
+                max_retries = max_retries,
+                "Provider failed, retrying with next"
+            );
+            rotate_provider(&state).await;
         }
     }
 
-    error!("All providers exhausted");
+    error!("All providers exhausted for OpenAI request");
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse {
@@ -922,7 +927,13 @@ async fn proxy_anthropic(
         }
 
         if attempt < max_retries - 1 {
-            rotate_provider(&state);
+            warn!(
+                failed_provider = %provider.name,
+                next_attempt = attempt + 2,
+                max_retries = max_retries,
+                "Provider failed, retrying with next"
+            );
+            rotate_provider(&state).await;
         }
     }
 
