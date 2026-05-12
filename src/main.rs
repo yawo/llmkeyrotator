@@ -8,12 +8,11 @@ use axum::{
 };
 use csv::ReaderBuilder;
 use futures::StreamExt;
+use tokio_stream::StreamExt as TokioStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     env,
-    error::Error,
     fs::File,
     io::BufReader,
     net::SocketAddr,
@@ -537,12 +536,29 @@ struct Provider {
     api_key: String,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug)]
 struct Stats {
     total_requests: AtomicUsize,
     total_errors: AtomicUsize,
     total_rotations: AtomicUsize,
-    provider_failures: HashMap<String, usize>,
+    provider_failures: Vec<AtomicUsize>,
+    skipped_providers: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Stats {
+    fn new(provider_count: usize) -> Self {
+        let mut provider_failures = Vec::with_capacity(provider_count);
+        for _ in 0..provider_count {
+            provider_failures.push(AtomicUsize::new(0));
+        }
+        Self {
+            total_requests: AtomicUsize::new(0),
+            total_errors: AtomicUsize::new(0),
+            total_rotations: AtomicUsize::new(0),
+            provider_failures,
+            skipped_providers: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -550,13 +566,21 @@ struct AppState {
     providers: Arc<Vec<Provider>>,
     current_index: Arc<AtomicUsize>,
     client: reqwest::Client,
-    stats: Arc<Mutex<Stats>>,
+    stats: Arc<Stats>,
     expected_api_key: String,
 }
 
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+impl AppState {
+    fn record_failure(&self, provider_name: &str) {
+        if let Some(idx) = self.providers.iter().position(|p| p.name == provider_name) {
+            self.stats.provider_failures[idx].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn load_providers(csv_path: &str) -> Vec<Provider> {
@@ -577,14 +601,39 @@ fn get_current_provider(state: &AppState) -> &Provider {
     &state.providers[idx % state.providers.len()]
 }
 
+async fn skip_provider_permanently(state: &AppState, name: &str) {
+    let mut skipped = state.stats.skipped_providers.lock().await;
+    if skipped.insert(name.to_string()) {
+        warn!(provider = %name, "Provider permanently skipped (payload too large)");
+        // Advance index if current provider is the one being skipped
+        let n = state.providers.len();
+        let idx = state.current_index.load(Ordering::Relaxed);
+        if state.providers[idx % n].name == name {
+            state.current_index.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn get_next_available_provider(state: &AppState) -> Option<&Provider> {
+    let skipped = state.stats.skipped_providers.lock().await;
+    let n = state.providers.len();
+    let start = state.current_index.load(Ordering::Relaxed);
+    for i in 0..n {
+        let p = &state.providers[(start + i) % n];
+        if !skipped.contains(&p.name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 async fn rotate_provider(state: &AppState) {
     let idx = state.current_index.fetch_add(1, Ordering::Relaxed);
     let new_idx = idx + 1;
     let from_name = &state.providers[idx % state.providers.len()].name;
     let to_name = &state.providers[new_idx % state.providers.len()].name;
     warn!(from = from_name, to = to_name, "Rotating to next provider");
-    let stats = state.stats.lock().await;
-    stats.total_rotations.fetch_add(1, Ordering::Relaxed);
+    state.stats.total_rotations.fetch_add(1, Ordering::Relaxed);
 }
 
 fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -611,24 +660,28 @@ fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let provider = get_current_provider(&state);
-    let stats = state.stats.lock().await;
     Json(serde_json::json!({
         "status": "ok",
         "providers": state.providers.len(),
         "current_provider": provider.name,
-        "total_requests": stats.total_requests.load(Ordering::Relaxed),
-        "total_errors": stats.total_errors.load(Ordering::Relaxed),
-        "total_rotations": stats.total_rotations.load(Ordering::Relaxed),
+        "total_requests": state.stats.total_requests.load(Ordering::Relaxed),
+        "total_errors": state.stats.total_errors.load(Ordering::Relaxed),
+        "total_rotations": state.stats.total_rotations.load(Ordering::Relaxed),
     }))
 }
 
 async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    let stats = state.stats.lock().await;
+    let failures: std::collections::HashMap<&str, usize> = state
+        .providers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.name.as_str(), state.stats.provider_failures[i].load(Ordering::Relaxed)))
+        .collect();
     Json(serde_json::json!({
-        "total_requests": stats.total_requests.load(Ordering::Relaxed),
-        "total_errors": stats.total_errors.load(Ordering::Relaxed),
-        "total_rotations": stats.total_rotations.load(Ordering::Relaxed),
-        "provider_failures": &stats.provider_failures,
+        "total_requests": state.stats.total_requests.load(Ordering::Relaxed),
+        "total_errors": state.stats.total_errors.load(Ordering::Relaxed),
+        "total_rotations": state.stats.total_rotations.load(Ordering::Relaxed),
+        "provider_failures": failures,
     }))
 }
 
@@ -646,18 +699,19 @@ async fn proxy_openai(
         return resp;
     }
 
-    {
-        let stats = state.stats.lock().await;
-        stats.total_requests.fetch_add(1, Ordering::Relaxed);
-    }
+    state.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
     let streaming = is_streaming_request(&body);
     let max_retries = state.providers.len();
 
     for attempt in 0..max_retries {
-        let provider = get_current_provider(&state);
+        let provider = match get_next_available_provider(&state).await {
+            Some(p) => p,
+            None => break,
+        };
         body["model"] = Value::String(provider.model.clone());
 
+        let start = std::time::Instant::now();
         info!(
             attempt = attempt + 1,
             provider = %provider.name,
@@ -679,35 +733,67 @@ async fn proxy_openai(
             .header("Content-Type", "application/json")
             .json(&body);
 
-        match request_builder.send().await {
+        let send_result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            request_builder.send(),
+        ).await;
+        let send_result = match send_result {
+            Ok(r) => r,
+            Err(_) => {
+                error!(provider = %provider.name, "OpenAI request timed out after 120s");
+                state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                state.record_failure(&provider.name);
+                if attempt < max_retries - 1 {
+                    warn!(failed_provider = %provider.name, next_attempt = attempt + 2, "Provider timed out, retrying with next");
+                    rotate_provider(&state).await;
+                }
+                continue;
+            }
+        };
+        match send_result {
             Ok(resp) => {
                 let status = resp.status();
+                let ttfb = start.elapsed();
                 if status.is_success() {
+                    info!(provider = %provider.name, ttfb_ms = ttfb.as_millis(), "Response received");
                     if streaming {
-                        let stream = resp.bytes_stream().map(|result| match result {
-                            Ok(bytes) => {
-                                let text = String::from_utf8_lossy(&bytes).to_string();
-                                let mut events = Vec::new();
-                                for line in text.lines() {
-                                    let line = line.trim();
-                                    if line.starts_with("data: ") {
-                                        let data = &line[6..];
-                                        if data != "[DONE]" {
-                                            events.push(Ok(
-                                                axum::response::sse::Event::default()
-                                                    .data(data.to_string()),
-                                            ));
+                        let buf = Arc::new(std::sync::Mutex::new(String::new()));
+                        let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
+                        let stream = futures::StreamExt::map(timed_stream, move |result| {
+                            match result {
+                                Ok(Ok(bytes)) => {
+                                    let mut buf = buf.lock().unwrap();
+                                    buf.push_str(&String::from_utf8_lossy(&bytes));
+                                    let mut events = Vec::new();
+                                    while let Some(pos) = buf.find('\n') {
+                                        let line = buf[..pos].trim().to_string();
+                                        buf.drain(..=pos);
+                                        if line.starts_with("data: ") {
+                                            let data = &line[6..];
+                                            if data != "[DONE]" {
+                                                events.push(Ok(
+                                                    axum::response::sse::Event::default()
+                                                        .data(data.to_string()),
+                                                ));
+                                            }
                                         }
                                     }
+                                    futures::stream::iter(events)
                                 }
-                                futures::stream::iter(events)
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Stream error");
-                                futures::stream::iter(vec![Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))])
+                                Ok(Err(e)) => {
+                                    error!(error = %e, "Stream error");
+                                    futures::stream::iter(vec![Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        e.to_string(),
+                                    ))])
+                                }
+                                Err(_) => {
+                                    error!("Stream chunk timed out after 30s");
+                                    futures::stream::iter(vec![Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "stream chunk timeout",
+                                    ))])
+                                }
                             }
                         });
                         let flat_stream = stream.flatten();
@@ -732,23 +818,22 @@ async fn proxy_openai(
                         status = %status,
                         provider = %provider.name,
                         body = %err_body,
+                        ttfb_ms = ttfb.as_millis(),
                         "Provider returned error"
                     );
+                    if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        skip_provider_permanently(&state, &provider.name).await;
+                    }
                 }
             }
             Err(e) => {
-                error!(error = %e, provider = %provider.name, "Request failed");
+                let elapsed = start.elapsed();
+                error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Request failed");
             }
         }
 
-        {
-            let mut stats = state.stats.lock().await;
-            stats.total_errors.fetch_add(1, Ordering::Relaxed);
-            *stats
-                .provider_failures
-                .entry(provider.name.clone())
-                .or_insert(0) += 1;
-        }
+        state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+        state.record_failure(&provider.name);
 
         if attempt < max_retries - 1 {
             warn!(
@@ -781,20 +866,21 @@ async fn proxy_anthropic(
         return resp;
     }
 
-    {
-        let stats = state.stats.lock().await;
-        stats.total_requests.fetch_add(1, Ordering::Relaxed);
-    }
+    state.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
     let streaming = is_streaming_request(&body);
     let max_retries = state.providers.len();
     let openai_body = anthropic::request_to_openai(&mut body);
 
     for attempt in 0..max_retries {
-        let provider = get_current_provider(&state);
+        let provider = match get_next_available_provider(&state).await {
+            Some(p) => p,
+            None => break,
+        };
         let mut forward_body = openai_body.clone();
         forward_body["model"] = Value::String(provider.model.clone());
 
+        let start = std::time::Instant::now();
         info!(
             attempt = attempt + 1,
             provider = %provider.name,
@@ -812,43 +898,62 @@ async fn proxy_anthropic(
             .header("Content-Type", "application/json")
             .json(&forward_body);
 
-        match request_builder.send().await {
+        let send_result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            request_builder.send(),
+        ).await;
+        let send_result = match send_result {
+            Ok(r) => r,
+            Err(_) => {
+                error!(provider = %provider.name, "Anthropic request timed out after 120s");
+                state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                state.record_failure(&provider.name);
+                if attempt < max_retries - 1 {
+                    warn!(failed_provider = %provider.name, next_attempt = attempt + 2, "Provider timed out, retrying with next");
+                    rotate_provider(&state).await;
+                }
+                continue;
+            }
+        };
+        match send_result {
             Ok(resp) => {
                 let status = resp.status();
+                let ttfb = start.elapsed();
                 if status.is_success() {
+                    info!(provider = %provider.name, ttfb_ms = ttfb.as_millis(), "Response received");
                     if streaming {
                         use std::sync::atomic::AtomicBool;
-                        let msg_id = Arc::new(std::sync::Mutex::new(String::new()));
-                        let msg_model = Arc::new(std::sync::Mutex::new(String::new()));
                         let sent_start = Arc::new(AtomicBool::new(false));
+                        let buf = Arc::new(std::sync::Mutex::new(String::new()));
+                        let msg_start: Arc<std::sync::Mutex<Option<(String, String)>>> = Arc::new(std::sync::Mutex::new(None));
 
-                        let msg_id_clone = msg_id.clone();
-                        let msg_model_clone = msg_model.clone();
                         let sent_start_clone = sent_start.clone();
+                        let msg_start_clone = msg_start.clone();
 
-                        let mut buf = String::new();
-                        let stream = resp.bytes_stream().map(move |result| {
+                        let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
+                        let stream = futures::StreamExt::map(timed_stream, move |result| {
                             match result {
-                                Ok(bytes) => {
+                                Ok(Ok(bytes)) => {
+                                    let mut buf = buf.lock().unwrap();
                                     buf.push_str(&String::from_utf8_lossy(&bytes));
                                     let mut events = Vec::new();
                                     while let Some(pos) = buf.find('\n') {
                                         let line = buf[..pos].trim().to_string();
-                                        buf = buf[pos + 1..].to_string();
+                                        buf.drain(..=pos);
                                         if line.starts_with("data: ") {
                                             let data = &line[6..];
                                             if data == "[DONE]" {
                                                 continue;
                                             }
                                             if !sent_start_clone.swap(true, Ordering::SeqCst) {
-                                                if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                                    let mut id = msg_id_clone.lock().unwrap();
-                                                    let mut model = msg_model_clone.lock().unwrap();
-                                                    *id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                    *model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                }
-                                                let id = msg_id_clone.lock().unwrap().clone();
-                                                let model = msg_model_clone.lock().unwrap().clone();
+                                                let (id, model) = if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                                    let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                    let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                    (id, model)
+                                                } else {
+                                                    (String::new(), String::new())
+                                                };
+                                                *msg_start_clone.lock().unwrap() = Some((id.clone(), model.clone()));
                                                 let (et, ed) = anthropic::sse_message_start(&id, &model);
                                                 events.push(Ok(
                                                     axum::response::sse::Event::default()
@@ -867,12 +972,18 @@ async fn proxy_anthropic(
                                     }
                                     futures::stream::iter(events)
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     error!(error = %e, "Anthropic stream error");
-                                    buf.clear();
                                     futures::stream::iter(vec![Err(std::io::Error::new(
                                         std::io::ErrorKind::Other,
                                         e.to_string(),
+                                    ))])
+                                }
+                                Err(_) => {
+                                    error!("Anthropic stream chunk timed out after 30s");
+                                    futures::stream::iter(vec![Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "stream chunk timeout",
                                     ))])
                                 }
                             }
@@ -904,23 +1015,22 @@ async fn proxy_anthropic(
                         status = %status,
                         provider = %provider.name,
                         body = %err_body,
+                        ttfb_ms = ttfb.as_millis(),
                         "Provider returned error for Anthropic request"
                     );
+                    if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        skip_provider_permanently(&state, &provider.name).await;
+                    }
                 }
             }
             Err(e) => {
-                error!(error = %e, provider = %provider.name, "Anthropic request failed");
+                let elapsed = start.elapsed();
+                error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Anthropic request failed");
             }
         }
 
-        {
-            let mut stats = state.stats.lock().await;
-            stats.total_errors.fetch_add(1, Ordering::Relaxed);
-            *stats
-                .provider_failures
-                .entry(provider.name.clone())
-                .or_insert(0) += 1;
-        }
+        state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+        state.record_failure(&provider.name);
 
         if attempt < max_retries - 1 {
             warn!(
@@ -954,106 +1064,116 @@ async fn catch_all(
         return resp;
     }
 
-    {
-        let stats = state.stats.lock().await;
-        stats.total_requests.fetch_add(1, Ordering::Relaxed);
-    }
+    state.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
-    let provider = get_current_provider(&state);
     let path = uri.path();
     let path = path
         .strip_prefix("/v1")
         .or_else(|| path.strip_prefix("/anthropic"))
         .unwrap_or(path);
-    let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
 
-    info!(provider = %provider.name, path = path, url = %url, "Proxying request");
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let raw_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
             error!(error = %e, "Failed to read body");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: "Failed to read body".to_string(),
-                }),
-            )
-                .into_response();
+                Json(ErrorResponse { error: "Failed to read body".to_string() }),
+            ).into_response();
         }
     };
 
-    let body_bytes = if let Ok(mut json) = serde_json::from_slice::<Value>(&body_bytes) {
-        json["model"] = Value::String(provider.model.clone());
-        serde_json::to_vec(&json).unwrap_or(body_bytes.to_vec())
-    } else {
-        body_bytes.to_vec()
-    };
+    let max_retries = state.providers.len();
+    // Parse JSON once outside the loop; model field is overwritten per-attempt
+    let parsed_json: Option<Value> = serde_json::from_slice(&raw_bytes).ok();
 
-    match state
-        .client
-        .request(method, &url)
-        .header("Authorization", format!("Bearer {}", provider.api_key))
-        .header(
-            "Content-Type",
-            headers
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/json"),
-        )
-        .body(body_bytes)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            let status = resp.status();
-            let resp_headers = resp.headers().clone();
-            match resp.bytes().await {
-                Ok(bytes) => {
-                    let mut builder = Response::builder().status(status);
-                    for (key, value) in resp_headers.iter() {
-                        if key != "transfer-encoding" && key != "content-length" {
-                            builder = builder.header(key, value);
+    for attempt in 0..max_retries {
+        let provider = match get_next_available_provider(&state).await {
+            Some(p) => p,
+            None => break,
+        };
+
+        let body_bytes = if let Some(mut json) = parsed_json.clone() {
+            json["model"] = Value::String(provider.model.clone());
+            serde_json::to_vec(&json).unwrap_or(raw_bytes.to_vec())
+        } else {
+            raw_bytes.to_vec()
+        };
+
+        let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
+        let start = std::time::Instant::now();
+        info!(attempt = attempt + 1, provider = %provider.name, path = path, url = %url, "Proxying request");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            state.client
+                .request(method.clone(), &url)
+                .header("Authorization", format!("Bearer {}", provider.api_key))
+                .header("Content-Type", &content_type)
+                .body(body_bytes)
+                .send(),
+        ).await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                let ttfb = start.elapsed();
+                let status = resp.status();
+                info!(provider = %provider.name, status = %status, ttfb_ms = ttfb.as_millis(), "Proxy response");
+                if status.is_success() || status.is_redirection() {
+                    let resp_headers = resp.headers().clone();
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            let mut builder = Response::builder().status(status);
+                            for (key, value) in resp_headers.iter() {
+                                if key != "transfer-encoding" && key != "content-length" {
+                                    builder = builder.header(key, value);
+                                }
+                            }
+                            return builder.body(Body::from(bytes)).unwrap_or_else(|e| {
+                                error!(error = %e, "Failed to build response");
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                            });
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to read response body");
                         }
                     }
-                    builder.body(Body::from(bytes)).unwrap_or_else(|e| {
-                        error!(error = %e, "Failed to build response");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    })
+                } else {
+                    let err_body = resp.text().await.unwrap_or_default();
+                    error!(status = %status, provider = %provider.name, body = %err_body, "Catch-all provider error");
+                    if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        skip_provider_permanently(&state, &provider.name).await;
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Failed to read response body");
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse {
-                            error: "Upstream error".to_string(),
-                        }),
-                    )
-                        .into_response()
-                }
+            }
+            Ok(Err(e)) => {
+                let elapsed = start.elapsed();
+                error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Catch-all request failed");
+            }
+            Err(_) => {
+                error!(provider = %provider.name, "Catch-all request timed out after 120s");
             }
         }
-        Err(e) => {
-            let mut err_msg = format!("{}", e);
-            let mut src = e.source();
-            while let Some(s) = src {
-                err_msg.push_str(&format!(" | source: {}", s));
-                src = s.source();
-            }
-            error!(error = %err_msg, provider = %provider.name, url = %url, "Proxy request failed");
-            {
-                let stats = state.stats.lock().await;
-                stats.total_errors.fetch_add(1, Ordering::Relaxed);
-            }
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: err_msg,
-                }),
-            )
-                .into_response()
+
+        state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+        state.record_failure(&provider.name);
+        if attempt < max_retries - 1 {
+            warn!(failed_provider = %provider.name, next_attempt = attempt + 2, "Catch-all provider failed, retrying");
+            rotate_provider(&state).await;
         }
     }
+
+    error!("All providers exhausted for catch-all request");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse { error: "All providers failed".to_string() }),
+    ).into_response()
 }
 
 #[tokio::main]
@@ -1084,17 +1204,23 @@ async fn main() {
         "Starting LLM Key Rotator"
     );
 
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(90));
+
+    if env::var("USE_CUSTOM_DNS").is_ok() {
+        info!("Using custom DNS resolver (Google DNS + Cloudflare)");
+        client_builder = client_builder.dns_resolver(Arc::new(dns::GoogleDnsResolver::new()));
+    }
+
+    let provider_count = providers.len();
     let state = AppState {
         providers: Arc::new(providers),
         current_index: Arc::new(AtomicUsize::new(0)),
-        client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .tcp_keepalive(std::time::Duration::from_secs(60))
-            .dns_resolver(Arc::new(dns::GoogleDnsResolver::new()))
-            .build()
-            .expect("Failed to build HTTP client"),
-        stats: Arc::new(Mutex::new(Stats::default())),
+        client: client_builder.build().expect("Failed to build HTTP client"),
+        stats: Arc::new(Stats::new(provider_count)),
         expected_api_key,
     };
 

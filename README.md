@@ -7,9 +7,14 @@ OpenAI-compatible proxy that rotates across providers on failure. Built with Rus
 - **Per-failure rotation** through providers from CSV
 - **Always uses CSV model** (ignores client's `model` field)
 - **Streaming (SSE) + non-streaming** support
-- **Structured logging** with `tracing`
+- **Structured logging** with `tracing` including TTFB (time to first byte) metrics
 - **`/health`** and **`/stats`** endpoints
 - **Static musl binaries** for Android ARM64 (via NDK); Ubuntu x64 requires `musl-tools`
+- **Optimized streaming** with proper line buffering to eliminate artificial latency
+- **Lock-free stats** using atomic operations for minimal contention
+- **Connection pooling** with configurable idle timeouts (10 connections per host, 90s idle timeout)
+- **Fast timeouts** (5s connect, 60s total) to quickly fail over to next provider
+- **Optional custom DNS** resolver (disabled by default, enable with `USE_CUSTOM_DNS` env var)
 
 ## CSV Format
 
@@ -27,6 +32,7 @@ groq,https://api.groq.com/openai/v1,llama-3.3-70b,gsk_...
 | `BASE_URL` | `http://0.0.0.0:3001/v1` | Bind address |
 | `API_KEY` | (none) | Require `Bearer` auth header |
 | `RUST_LOG` | `llmkeyrotator=info` | Log level |
+| `USE_CUSTOM_DNS` | (unset) | Set to any value to use Google DNS (8.8.8.8, 8.8.4.4) + Cloudflare (1.1.1.1) instead of system DNS |
 
 ## Endpoints
 

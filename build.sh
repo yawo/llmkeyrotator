@@ -26,3 +26,5 @@ if command -v musl-gcc &>/dev/null; then
 else
     echo "SKIPPED: musl-gcc not found. Install with: sudo apt install musl-tools"
 fi
+cp target/aarch64-linux-android/release/llmkeyrotator llmkeyrotator-android
+cp target/x86_64-unknown-linux-musl/release/llmkeyrotator llmkeyrotator-linux 
