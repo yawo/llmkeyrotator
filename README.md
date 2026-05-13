@@ -33,7 +33,8 @@ groq,https://api.groq.com/openai/v1,llama-3.3-70b,gsk_...
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CSV_PATH` | `$HOME/code/freellmkeys.csv` | Path to provider CSV |
-| `BASE_URL` | `http://0.0.0.0:3001/v1` | Bind address |
+| `BASE_URL` | `http://0.0.0.0:3001/v1` | Bind address openai-compatible|
+| `ANTHROPIC_BASE_URL` | `http://0.0.0.0:3001/anthropic` | Bind address anthropic-compatible|
 | `API_KEY` | (none) | Require `Bearer` auth header |
 | `RUST_LOG` | `llmkeyrotator=info` | Log level |
 | `USE_CUSTOM_DNS` | (unset) | Set to any value to use Google DNS (8.8.8.8, 8.8.4.4) + Cloudflare (1.1.1.1) instead of system DNS |
