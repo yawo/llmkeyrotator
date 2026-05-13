@@ -24,7 +24,62 @@ use tracing::{error, info, warn};
 
 mod anthropic {
     use serde_json::Value;
-    use std::collections::HashSet;
+
+    /// Inject Anthropic cache_control markers into the body (in-place).
+    /// - System prompt → wrapped as array block with cache_control
+    /// - Last user message → last content block gets cache_control
+    /// Safe to call on already-hinted bodies (idempotent for the system block).
+    pub fn apply_cache_hints(body: &mut Value) {
+        let cc = serde_json::json!({"type": "ephemeral"});
+
+        // System: string → array block with cache_control
+        if let Some(system) = body.get("system") {
+            let new_system = if let Some(s) = system.as_str() {
+                if !s.is_empty() {
+                    Some(serde_json::json!([{"type": "text", "text": s, "cache_control": cc}]))
+                } else {
+                    None
+                }
+            } else if system.is_array() {
+                let mut arr = system.as_array().unwrap().clone();
+                if let Some(last) = arr.last_mut() {
+                    if last.get("cache_control").is_none() {
+                        last["cache_control"] = cc.clone();
+                    }
+                }
+                Some(Value::Array(arr))
+            } else {
+                None
+            };
+            if let Some(s) = new_system {
+                body["system"] = s;
+            }
+        }
+
+        // Last user message: add cache_control to its last content block
+        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            if let Some(last_user) = messages.iter_mut().rev().find(|m| {
+                m.get("role").and_then(|r| r.as_str()) == Some("user")
+            }) {
+                match last_user.get_mut("content") {
+                    Some(Value::Array(blocks)) => {
+                        if let Some(last_block) = blocks.last_mut() {
+                            if last_block.get("cache_control").is_none() {
+                                last_block["cache_control"] = cc;
+                            }
+                        }
+                    }
+                    Some(Value::String(s)) => {
+                        let text = s.clone();
+                        last_user["content"] = serde_json::json!([{
+                            "type": "text", "text": text, "cache_control": cc
+                        }]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     pub fn request_to_openai(body: &mut Value) -> Value {
         let mut openai = serde_json::Map::new();
@@ -61,11 +116,6 @@ mod anthropic {
             for msg in anthropic_messages {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                 let content = msg.get("content");
-
-                if role == "tool" {
-                    messages.push(content.unwrap_or(&Value::Null).clone());
-                    continue;
-                }
 
                 match content {
                     Some(Value::String(s)) => {
@@ -123,10 +173,6 @@ mod anthropic {
                             }
                         }
 
-                        for tr in &tool_results {
-                            messages.push(tr.clone());
-                        }
-
                         if !tool_calls.is_empty() || !text_parts.is_empty() {
                             let mut msg_obj = serde_json::Map::new();
                             msg_obj.insert("role".to_string(), Value::String(role.to_string()));
@@ -142,6 +188,10 @@ mod anthropic {
                             }
 
                             messages.push(Value::Object(msg_obj));
+                        }
+
+                        for tr in tool_results {
+                            messages.push(tr);
                         }
                     }
                     _ => {
@@ -207,7 +257,7 @@ mod anthropic {
             if let Some(tool_choice) = body.get("tool_choice") {
                 let converted = match tool_choice.get("type").and_then(|t| t.as_str()) {
                     Some("auto") => serde_json::json!("auto"),
-                    Some("any") => serde_json::json!("any"),
+                    Some("any") => serde_json::json!("required"),
                     Some("tool") => {
                         if let Some(name) = tool_choice.get("name") {
                             serde_json::json!({
@@ -284,12 +334,14 @@ mod anthropic {
             }
 
             if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                stop_reason = match reason {
-                    "stop" => "end_turn",
-                    "length" => "max_tokens",
-                    "tool_calls" => "tool_use",
-                    _ => "end_turn",
-                };
+                if stop_reason != "tool_use" {
+                    stop_reason = match reason {
+                        "stop" => "end_turn",
+                        "length" => "max_tokens",
+                        "tool_calls" => "tool_use",
+                        _ => "end_turn",
+                    };
+                }
             }
         }
 
@@ -337,7 +389,7 @@ mod anthropic {
         )
     }
 
-    pub fn sse_chunk_to_anthropic(openai_chunk: &str) -> Vec<(String, String)> {
+    pub fn sse_chunk_to_anthropic(openai_chunk: &str, has_text: &mut bool, opened_tool_indices: &mut std::collections::HashSet<usize>) -> Vec<(String, String)> {
         let mut events = Vec::new();
 
         let chunk: Value = match serde_json::from_str(openai_chunk) {
@@ -345,8 +397,6 @@ mod anthropic {
             Err(_) => return events,
         };
 
-        let mut has_text = false;
-        let mut opened_tool_indices: HashSet<usize> = HashSet::new();
         let mut stop_reason: Option<String> = None;
 
         if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
@@ -354,7 +404,7 @@ mod anthropic {
                 if let Some(delta) = choice.get("delta") {
                     if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                         if !text.is_empty() {
-                            if !has_text {
+                            if !*has_text {
                                 events.push((
                                     "content_block_start".to_string(),
                                     serde_json::json!({
@@ -363,7 +413,7 @@ mod anthropic {
                                         "content_block": { "type": "text", "text": "" }
                                     }).to_string(),
                                 ));
-                                has_text = true;
+                                *has_text = true;
                             }
                             events.push((
                                 "content_block_delta".to_string(),
@@ -379,6 +429,8 @@ mod anthropic {
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                         for (i, tc) in tool_calls.iter().enumerate() {
                             let tc_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(i as u64) as usize;
+                            // Offset by 1 so tool blocks never collide with the text block at index 0
+                            let anthropic_index = tc_index + 1;
                             let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                             let tc_name = tc
                                 .get("function")
@@ -391,12 +443,12 @@ mod anthropic {
                                 .and_then(|a| a.as_str())
                                 .unwrap_or("");
 
-                            if !opened_tool_indices.contains(&tc_index) {
+                            if !opened_tool_indices.contains(&anthropic_index) {
                                 events.push((
                                     "content_block_start".to_string(),
                                     serde_json::json!({
                                         "type": "content_block_start",
-                                        "index": tc_index,
+                                        "index": anthropic_index,
                                         "content_block": {
                                             "type": "tool_use",
                                             "id": tc_id,
@@ -405,7 +457,7 @@ mod anthropic {
                                         }
                                     }).to_string(),
                                 ));
-                                opened_tool_indices.insert(tc_index);
+                                opened_tool_indices.insert(anthropic_index);
                             }
 
                             if !tc_args.is_empty() {
@@ -413,7 +465,7 @@ mod anthropic {
                                     "content_block_delta".to_string(),
                                     serde_json::json!({
                                         "type": "content_block_delta",
-                                        "index": tc_index,
+                                        "index": anthropic_index,
                                         "delta": {
                                             "type": "input_json_delta",
                                             "partial_json": tc_args
@@ -438,7 +490,7 @@ mod anthropic {
 
         if let Some(reason) = stop_reason {
             let mut all_stop_indices: Vec<usize> = Vec::new();
-            if has_text {
+            if *has_text {
                 all_stop_indices.push(0);
             }
             all_stop_indices.extend(opened_tool_indices.iter().copied());
@@ -568,6 +620,8 @@ struct AppState {
     client: reqwest::Client,
     stats: Arc<Stats>,
     expected_api_key: String,
+    cache_enabled: bool,
+    compress_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -594,11 +648,6 @@ fn load_providers(csv_path: &str) -> Vec<Provider> {
     }
     info!(count = providers.len(), "Loaded providers from CSV");
     providers
-}
-
-fn get_current_provider(state: &AppState) -> &Provider {
-    let idx = state.current_index.load(Ordering::Relaxed);
-    &state.providers[idx % state.providers.len()]
 }
 
 async fn skip_provider_permanently(state: &AppState, name: &str) {
@@ -659,11 +708,14 @@ fn auth_check(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let provider = get_current_provider(&state);
+    let provider_name = get_next_available_provider(&state)
+        .await
+        .map(|p| p.name.as_str())
+        .unwrap_or("none");
     Json(serde_json::json!({
         "status": "ok",
         "providers": state.providers.len(),
-        "current_provider": provider.name,
+        "current_provider": provider_name,
         "total_requests": state.stats.total_requests.load(Ordering::Relaxed),
         "total_errors": state.stats.total_errors.load(Ordering::Relaxed),
         "total_rotations": state.stats.total_rotations.load(Ordering::Relaxed),
@@ -685,6 +737,44 @@ async fn stats(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+const COMPRESS_PROMPT: &str = "Ultra-compressed replies. Drop articles/fillers/pleasantries/hedging. Fragments OK. Short synonyms. Technical terms exact. Code blocks unchanged. Errors quoted exact. Pattern: [thing] [action] [reason]. Abbreviate prose (DB/auth/config/req/res/fn/impl), arrows for causality (X→Y). Never abbreviate code symbols/fn names/API names/error strings.";
+
+/// Append compress hint to system prompt in an OpenAI-format body (mutates in place).
+fn apply_compress_hint_openai(body: &mut Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        if let Some(sys) = messages.iter_mut().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")) {
+            let existing = sys["content"].as_str().unwrap_or("").to_string();
+            if !existing.contains(COMPRESS_PROMPT) {
+                sys["content"] = Value::String(format!("{}\n\n{}", existing.trim_end(), COMPRESS_PROMPT));
+            }
+        } else {
+            messages.insert(0, serde_json::json!({"role": "system", "content": COMPRESS_PROMPT}));
+        }
+    }
+}
+
+/// Append compress hint to system prompt in an Anthropic-format body (mutates in place).
+fn apply_compress_hint_anthropic(body: &mut Value) {
+    match body.get("system") {
+        Some(Value::String(s)) => {
+            if !s.contains(COMPRESS_PROMPT) {
+                let s = format!("{}\n\n{}", s.trim_end(), COMPRESS_PROMPT);
+                body["system"] = Value::String(s);
+            }
+        }
+        Some(Value::Array(_)) => {
+            if let Some(arr) = body["system"].as_array_mut() {
+                if !arr.iter().any(|b| b.get("text").and_then(|t| t.as_str()) == Some(COMPRESS_PROMPT)) {
+                    arr.push(serde_json::json!({"type": "text", "text": COMPRESS_PROMPT}));
+                }
+            }
+        }
+        _ => {
+            body["system"] = Value::String(COMPRESS_PROMPT.to_string());
+        }
+    }
+}
+
 fn is_streaming_request(body: &Value) -> bool {
     body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -703,6 +793,10 @@ async fn proxy_openai(
 
     let streaming = is_streaming_request(&body);
     let max_retries = state.providers.len();
+
+    if state.compress_enabled {
+        apply_compress_hint_openai(&mut body);
+    }
 
     for attempt in 0..max_retries {
         let provider = match get_next_available_provider(&state).await {
@@ -859,7 +953,7 @@ async fn proxy_openai(
 async fn proxy_anthropic(
     State(state): State<AppState>,
     headers: HeaderMap,
-    _uri: Uri,
+    uri: Uri,
     Json(mut body): Json<Value>,
 ) -> Response {
     if let Err(resp) = auth_check(&state, &headers) {
@@ -868,165 +962,196 @@ async fn proxy_anthropic(
 
     state.stats.total_requests.fetch_add(1, Ordering::Relaxed);
 
+    let request_id = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("anthropic-request-id"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string();
+    info!(path = %uri.path(), request_id = %request_id, "Anthropic request received");
+
     let streaming = is_streaming_request(&body);
     let max_retries = state.providers.len();
-    let openai_body = anthropic::request_to_openai(&mut body);
+
+    // Prepare cached and uncached OpenAI bodies up front
+    if state.compress_enabled {
+        apply_compress_hint_anthropic(&mut body);
+    }
+    let openai_body_plain = anthropic::request_to_openai(&mut body);
+    let openai_body_cached = if state.cache_enabled {
+        let mut cached = body.clone();
+        anthropic::apply_cache_hints(&mut cached);
+        Some(anthropic::request_to_openai(&mut cached))
+    } else {
+        None
+    };
 
     for attempt in 0..max_retries {
         let provider = match get_next_available_provider(&state).await {
             Some(p) => p,
             None => break,
         };
-        let mut forward_body = openai_body.clone();
-        forward_body["model"] = Value::String(provider.model.clone());
 
-        let start = std::time::Instant::now();
-        info!(
-            attempt = attempt + 1,
-            provider = %provider.name,
-            model = %provider.model,
-            streaming = streaming,
-            "Forwarding Anthropic request"
-        );
-
-        let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
-
-        let request_builder = state
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", provider.api_key))
-            .header("Content-Type", "application/json")
-            .json(&forward_body);
-
-        let send_result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            request_builder.send(),
-        ).await;
-        let send_result = match send_result {
-            Ok(r) => r,
-            Err(_) => {
-                error!(provider = %provider.name, "Anthropic request timed out after 120s");
-                state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                state.record_failure(&provider.name);
-                if attempt < max_retries - 1 {
-                    warn!(failed_provider = %provider.name, next_attempt = attempt + 2, "Provider timed out, retrying with next");
-                    rotate_provider(&state).await;
-                }
-                continue;
-            }
+        // Try cached body first (if enabled), fall back to plain on 400
+        let candidates: &[(&Value, bool)] = if let Some(ref cached) = openai_body_cached {
+            &[(cached, true), (&openai_body_plain, false)]
+        } else {
+            &[(&openai_body_plain, false)]
         };
-        match send_result {
-            Ok(resp) => {
-                let status = resp.status();
-                let ttfb = start.elapsed();
-                if status.is_success() {
-                    info!(provider = %provider.name, ttfb_ms = ttfb.as_millis(), "Response received");
-                    if streaming {
-                        use std::sync::atomic::AtomicBool;
-                        let sent_start = Arc::new(AtomicBool::new(false));
-                        let buf = Arc::new(std::sync::Mutex::new(String::new()));
-                        let msg_start: Arc<std::sync::Mutex<Option<(String, String)>>> = Arc::new(std::sync::Mutex::new(None));
 
-                        let sent_start_clone = sent_start.clone();
-                        let msg_start_clone = msg_start.clone();
+        'inner: for &(base_body, with_cache) in candidates {
+            let mut forward_body = base_body.clone();
+            forward_body["model"] = Value::String(provider.model.clone());
 
-                        let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
-                        let stream = futures::StreamExt::map(timed_stream, move |result| {
-                            match result {
-                                Ok(Ok(bytes)) => {
-                                    let mut buf = buf.lock().unwrap();
-                                    buf.push_str(&String::from_utf8_lossy(&bytes));
-                                    let mut events = Vec::new();
-                                    while let Some(pos) = buf.find('\n') {
-                                        let line = buf[..pos].trim().to_string();
-                                        buf.drain(..=pos);
-                                        if line.starts_with("data: ") {
-                                            let data = &line[6..];
-                                            if data == "[DONE]" {
-                                                continue;
+            let start = std::time::Instant::now();
+            info!(
+                attempt = attempt + 1,
+                provider = %provider.name,
+                model = %provider.model,
+                streaming = streaming,
+                cache = with_cache,
+                "Forwarding Anthropic request"
+            );
+
+            let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+
+            let request_builder = state
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", provider.api_key))
+                .header("Content-Type", "application/json")
+                .json(&forward_body);
+
+            let send_result = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                request_builder.send(),
+            ).await;
+            let send_result = match send_result {
+                Ok(r) => r,
+                Err(_) => {
+                    error!(provider = %provider.name, "Anthropic request timed out after 120s");
+                    state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                    state.record_failure(&provider.name);
+                    if attempt < max_retries - 1 {
+                        warn!(failed_provider = %provider.name, next_attempt = attempt + 2, "Provider timed out, retrying with next");
+                        rotate_provider(&state).await;
+                    }
+                    break 'inner;
+                }
+            };
+            match send_result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let ttfb = start.elapsed();
+                    if status.is_success() {
+                        info!(provider = %provider.name, ttfb_ms = ttfb.as_millis(), "Response received");
+                        if streaming {
+                            // Use a channel so we can return HTTP 200 + SSE headers immediately,
+                            // before the upstream sends any bytes. This prevents Claude Code from
+                            // retrying the request when TTFB is slow.
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+
+                            // Send an immediate ping so the HTTP response flushes to the client right away.
+                            let ping = b"event: ping\ndata: {\"type\":\"ping\"}\n\n";
+                            let _ = tx.send(Ok(axum::body::Bytes::from_static(ping))).await;
+
+                            tokio::spawn(async move {
+                                let mut buf = String::new();
+                                let mut sent_start = false;
+                                let mut has_text = false;
+                                let mut opened_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+                                let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
+                                tokio::pin!(timed_stream);
+                                while let Some(result) = TokioStreamExt::next(&mut timed_stream).await {
+                                    match result {
+                                        Ok(chunk_result) => match chunk_result {
+                                            Ok(bytes) => {
+                                                buf.push_str(&String::from_utf8_lossy(&bytes));
+                                                while let Some(pos) = buf.find('\n') {
+                                                    let line = buf[..pos].trim().to_string();
+                                                    buf.drain(..=pos);
+                                                    if !line.starts_with("data: ") { continue; }
+                                                    let data = &line[6..];
+                                                    if data == "[DONE]" { continue; }
+                                                    if !sent_start {
+                                                        sent_start = true;
+                                                        let (id, model) = if let Ok(v) = serde_json::from_str::<Value>(data) {
+                                                            let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                            let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                            (id, model)
+                                                        } else {
+                                                            (String::new(), String::new())
+                                                        };
+                                                        let (et, ed) = anthropic::sse_message_start(&id, &model);
+                                                        let msg = format!("event: {}\ndata: {}\n\n", et, ed);
+                                                        if tx.send(Ok(axum::body::Bytes::from(msg))).await.is_err() { return; }
+                                                    }
+                                                    for (event_type, event_data) in anthropic::sse_chunk_to_anthropic(data, &mut has_text, &mut opened_tools) {
+                                                        let msg = format!("event: {}\ndata: {}\n\n", event_type, event_data);
+                                                        if tx.send(Ok(axum::body::Bytes::from(msg))).await.is_err() { return; }
+                                                    }
+                                                }
                                             }
-                                            if !sent_start_clone.swap(true, Ordering::SeqCst) {
-                                                let (id, model) = if let Ok(v) = serde_json::from_str::<Value>(data) {
-                                                    let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                    let model = v.get("model").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                    (id, model)
-                                                } else {
-                                                    (String::new(), String::new())
-                                                };
-                                                *msg_start_clone.lock().unwrap() = Some((id.clone(), model.clone()));
-                                                let (et, ed) = anthropic::sse_message_start(&id, &model);
-                                                events.push(Ok(
-                                                    axum::response::sse::Event::default()
-                                                        .event(et)
-                                                        .data(ed),
-                                                ));
+                                            Err(e) => {
+                                                error!(error = %e, "Anthropic stream error");
+                                                let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))).await;
+                                                return;
                                             }
-                                            for (event_type, event_data) in anthropic::sse_chunk_to_anthropic(data) {
-                                                events.push(Ok(
-                                                    axum::response::sse::Event::default()
-                                                        .event(event_type)
-                                                        .data(event_data),
-                                                ));
-                                            }
+                                        },
+                                        Err(_) => {
+                                            error!("Anthropic stream chunk timed out after 30s");
+                                            let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stream chunk timeout"))).await;
+                                            return;
                                         }
                                     }
-                                    futures::stream::iter(events)
                                 }
-                                Ok(Err(e)) => {
-                                    error!(error = %e, "Anthropic stream error");
-                                    futures::stream::iter(vec![Err(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        e.to_string(),
-                                    ))])
-                                }
-                                Err(_) => {
-                                    error!("Anthropic stream chunk timed out after 30s");
-                                    futures::stream::iter(vec![Err(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "stream chunk timeout",
-                                    ))])
-                                }
-                            }
-                        });
+                            });
 
-                        let flat_stream = stream.flatten();
-
-                        return Sse::new(flat_stream)
-                            .keep_alive(
-                                axum::response::sse::KeepAlive::new()
-                                    .interval(std::time::Duration::from_secs(15))
-                                    .text("keep-alive"),
-                            )
-                            .into_response();
-                    } else {
-                        match resp.json::<Value>().await {
-                            Ok(json) => {
-                                let anthropic_resp = anthropic::response_to_anthropic(&json);
-                                return Json(anthropic_resp).into_response();
-                            }
-                            Err(e) => {
-                                error!(error = %e, provider = %provider.name, "Failed to parse Anthropic response");
+                            let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "text/event-stream")
+                                .header("Cache-Control", "no-cache")
+                                .header("Connection", "keep-alive")
+                                .body(body)
+                                .unwrap();
+                        } else {
+                            match resp.json::<Value>().await {
+                                Ok(json) => {
+                                    let anthropic_resp = anthropic::response_to_anthropic(&json);
+                                    return Json(anthropic_resp).into_response();
+                                }
+                                Err(e) => {
+                                    error!(error = %e, provider = %provider.name, "Failed to parse Anthropic response");
+                                }
                             }
                         }
-                    }
-                } else {
-                    let err_body = resp.text().await.unwrap_or_default();
-                    error!(
-                        status = %status,
-                        provider = %provider.name,
-                        body = %err_body,
-                        ttfb_ms = ttfb.as_millis(),
-                        "Provider returned error for Anthropic request"
-                    );
-                    if status == StatusCode::PAYLOAD_TOO_LARGE {
-                        skip_provider_permanently(&state, &provider.name).await;
+                    } else if status == StatusCode::BAD_REQUEST && with_cache {
+                        // Provider rejected cache_control — retry same provider without cache
+                        let err_body = resp.text().await.unwrap_or_default();
+                        warn!(provider = %provider.name, body = %err_body, "Cache hints rejected (400), retrying without cache");
+                        continue; // try plain body next
+                    } else {
+                        let err_body = resp.text().await.unwrap_or_default();
+                        error!(
+                            status = %status,
+                            provider = %provider.name,
+                            body = %err_body,
+                            ttfb_ms = ttfb.as_millis(),
+                            "Provider returned error for Anthropic request"
+                        );
+                        if status == StatusCode::PAYLOAD_TOO_LARGE {
+                            skip_provider_permanently(&state, &provider.name).await;
+                        }
                     }
                 }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Anthropic request failed");
+                }
             }
-            Err(e) => {
-                let elapsed = start.elapsed();
-                error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Anthropic request failed");
-            }
+            break 'inner;
         }
 
         state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
@@ -1078,13 +1203,13 @@ async fn catch_all(
         .unwrap_or("application/json")
         .to_string();
 
-    let raw_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let raw_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             error!(error = %e, "Failed to read body");
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: "Failed to read body".to_string() }),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorResponse { error: "Request body too large".to_string() }),
             ).into_response();
         }
     };
@@ -1192,6 +1317,14 @@ async fn main() {
     let bind_addr = env::var("BASE_URL")
         .unwrap_or_else(|_| "http://0.0.0.0:3001/v1".to_string());
     let expected_api_key = env::var("API_KEY").unwrap_or_default();
+    let cache_enabled = std::env::args().any(|a| a == "--cache");
+    if cache_enabled {
+        info!("Prompt caching enabled (--cache): cache_control hints will be injected for Anthropic requests");
+    }
+    let compress_enabled = std::env::args().any(|a| a == "--compress");
+    if compress_enabled {
+        info!("Compress mode enabled (--compress): caveman system prompt will be injected into all requests");
+    }
 
     let providers = load_providers(&csv_path);
     if providers.is_empty() {
@@ -1222,6 +1355,8 @@ async fn main() {
         client: client_builder.build().expect("Failed to build HTTP client"),
         stats: Arc::new(Stats::new(provider_count)),
         expected_api_key,
+        cache_enabled,
+        compress_enabled,
     };
 
     let app = Router::new()

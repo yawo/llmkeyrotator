@@ -1,19 +1,23 @@
 # LLM Key Rotator
 
-OpenAI-compatible proxy that rotates across providers on failure. Built with Rust + axum.
+OpenAI-compatible reverse proxy that rotates across providers on failure, with Anthropic↔OpenAI format translation. Built with Rust + axum.
 
 ## Features
 
 - **Per-failure rotation** through providers from CSV
 - **Always uses CSV model** (ignores client's `model` field)
-- **Streaming (SSE) + non-streaming** support
+- **Streaming (SSE) + non-streaming** support for both OpenAI and Anthropic formats
+- **Anthropic↔OpenAI translation** — full message, tool call, and tool result conversion
+- **`--cache` flag** — injects Anthropic `cache_control` hints into system prompt and last user message; falls back to uncached on 400
+- **`--compress` flag** — injects a brevity system prompt into all requests to reduce token usage
+- **Permanent provider skip** on 413 (payload too large); skipped providers excluded from rotation
 - **Structured logging** with `tracing` including TTFB (time to first byte) metrics
 - **`/health`** and **`/stats`** endpoints
 - **Static musl binaries** for Android ARM64 (via NDK); Ubuntu x64 requires `musl-tools`
 - **Optimized streaming** with proper line buffering to eliminate artificial latency
 - **Lock-free stats** using atomic operations for minimal contention
 - **Connection pooling** with configurable idle timeouts (10 connections per host, 90s idle timeout)
-- **Fast timeouts** (5s connect, 60s total) to quickly fail over to next provider
+- **Fast timeouts** (5s connect, 120s total) to quickly fail over to next provider
 - **Optional custom DNS** resolver (disabled by default, enable with `USE_CUSTOM_DNS` env var)
 
 ## CSV Format
