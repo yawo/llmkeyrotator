@@ -17,3 +17,4 @@ alibaba,https://dashscope-intl.aliyuncs.com/compatible-mode/v1,qwen3.5-flash,you
 kilo,https://api.kilo.ai/api/gateway,nvidia/nemotron-3-super-120b-a12b:free,your-api-key
 llm7,https://api.llm7.io/v1,default,your-api-key
 upstage,https://api.upstage.ai/v1/,solar-pro2,your-api-key
+byteplus,https://ark.ap-southeast.bytepluses.com/api/v3,gpt-oss-120b-250805,your-api-key
