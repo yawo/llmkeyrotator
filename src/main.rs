@@ -856,7 +856,7 @@ async fn proxy_openai(
                     info!(provider = %provider.name, ttfb_ms = ttfb.as_millis(), "Response received");
                     if streaming {
                         let buf = Arc::new(std::sync::Mutex::new(String::new()));
-                        let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
+                        let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(90));
                         let stream = futures::StreamExt::map(timed_stream, move |result| {
                             match result {
                                 Ok(Ok(bytes)) => {
@@ -886,7 +886,7 @@ async fn proxy_openai(
                                     ))])
                                 }
                                 Err(_) => {
-                                    error!("Stream chunk timed out after 30s");
+                                    error!("Stream chunk timed out after 90s");
                                     futures::stream::iter(vec![Err(std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
                                         "stream chunk timeout",
@@ -1072,7 +1072,7 @@ async fn proxy_anthropic(
                                 let mut has_text = false;
                                 let mut opened_tools: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-                                let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(30));
+                                let timed_stream = TokioStreamExt::timeout(resp.bytes_stream(), std::time::Duration::from_secs(90));
                                 tokio::pin!(timed_stream);
                                 while let Some(result) = TokioStreamExt::next(&mut timed_stream).await {
                                     match result {
@@ -1111,7 +1111,7 @@ async fn proxy_anthropic(
                                             }
                                         },
                                         Err(_) => {
-                                            error!("Anthropic stream chunk timed out after 30s");
+                                            error!("Anthropic stream chunk timed out after 90s");
                                             let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stream chunk timeout"))).await;
                                             return;
                                         }
@@ -1356,7 +1356,7 @@ async fn main() {
 
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
-        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .tcp_keepalive(std::time::Duration::from_secs(90))
         .pool_max_idle_per_host(10)
         .pool_idle_timeout(std::time::Duration::from_secs(90));
 
