@@ -819,6 +819,10 @@ async fn proxy_openai(
             .strip_prefix("/v1")
             .unwrap_or(path);
         let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
+        let request_timeout: u64 = env::var("REQUEST_TIMEOUT")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(120);
 
         let request_builder = state
             .client
@@ -828,13 +832,13 @@ async fn proxy_openai(
             .json(&body);
 
         let send_result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(request_timeout),
             request_builder.send(),
         ).await;
         let send_result = match send_result {
             Ok(r) => r,
             Err(_) => {
-                error!(provider = %provider.name, "OpenAI request timed out after 120s");
+                error!(provider = %provider.name, request_timeout=%request_timeout, "OpenAI request timed out after 120s");
                 state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
                 state.record_failure(&provider.name);
                 if attempt < max_retries - 1 {
@@ -972,6 +976,13 @@ async fn proxy_anthropic(
 
     let streaming = is_streaming_request(&body);
     let max_retries = state.providers.len();
+    let request_timeout: u64 = env::var("REQUEST_TIMEOUT")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(120);
+
+
+    
 
     // Prepare cached and uncached OpenAI bodies up front
     if state.compress_enabled {
@@ -1023,13 +1034,13 @@ async fn proxy_anthropic(
                 .json(&forward_body);
 
             let send_result = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
+                std::time::Duration::from_secs(request_timeout),
                 request_builder.send(),
             ).await;
             let send_result = match send_result {
                 Ok(r) => r,
                 Err(_) => {
-                    error!(provider = %provider.name, "Anthropic request timed out after 120s");
+                    error!(provider = %provider.name,request_timeout = %request_timeout,  "Anthropic request timed out after 120s");
                     state.stats.total_errors.fetch_add(1, Ordering::Relaxed);
                     state.record_failure(&provider.name);
                     if attempt < max_retries - 1 {
@@ -1233,10 +1244,16 @@ async fn catch_all(
 
         let url = format!("{}{}", provider.base_url.trim_end_matches('/'), path);
         let start = std::time::Instant::now();
+        let request_timeout: u64 = env::var("REQUEST_TIMEOUT")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(120);
+
+
         info!(attempt = attempt + 1, provider = %provider.name, path = path, url = %url, "Proxying request");
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(request_timeout),
             state.client
                 .request(method.clone(), &url)
                 .header("Authorization", format!("Bearer {}", provider.api_key))
@@ -1282,7 +1299,7 @@ async fn catch_all(
                 error!(error = %e, provider = %provider.name, elapsed_ms = elapsed.as_millis(), "Catch-all request failed");
             }
             Err(_) => {
-                error!(provider = %provider.name, "Catch-all request timed out after 120s");
+                error!(provider = %provider.name, request_timeout=%request_timeout, "Catch-all request timed out after 120s");
             }
         }
 
